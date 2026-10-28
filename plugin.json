@@ -1,0 +1,15 @@
+{
+  "name": "Trailer Hero",
+  "author": "Henrique",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": [
+      "library",
+      "trailer",
+      "video"
+    ],
+    "description": "Plays the game's trailer on the game page and behind the Home game selection, and can show the game's logo instead of its name.",
+    "image": ""
+  }
+}
