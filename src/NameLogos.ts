@@ -1,4 +1,5 @@
-import { appIdFromImageSrc, logoCandidates } from './logos';
+import { uniqueUrls } from './art';
+import { appIdFromImageSrc, logoCandidates, versionKey } from './logos';
 import type { Settings } from './settings';
 
 const TICK_MS = 120;
@@ -11,6 +12,11 @@ const FADE_OUT_MS = 120;
 const CENTERED_TOLERANCE_PX = 6;
 const STYLE_ID = 'trailer-hero-logo-style';
 const HIDDEN_CLASS = 'trailer-hero-name-hidden';
+/** Textos do nome que o plugin cuida: ficam invisíveis desde o primeiro quadro, até haver logo ou decisão de mostrar o texto. */
+const MANAGED_CLASS = 'trailer-hero-name-managed';
+const SHOW_CLASS = 'trailer-hero-name-show';
+/** Sem logo pronta depois deste tempo com o card em foco, o texto aparece em vez de deixar o card sem nome. */
+const REVEAL_AFTER_MS = 700;
 
 const STORE_KEY = 'trailer-hero:logos';
 const STORE_MAX = 60;
@@ -18,7 +24,7 @@ const STORE_REFRESH_MS = 7 * 24 * 3600_000;
 /** Cópia guardada em disco: no máximo esta altura (a logo na tela passa de 200 px só com zoom extremo). */
 const STORE_HEIGHT_PX = 200;
 
-type Stored = Record<string, { data: string; at: number }>;
+type Stored = Record<string, { data: string; at: number; v?: string }>;
 
 function loadStored(): Stored {
   try { return JSON.parse(localStorage.getItem(STORE_KEY) ?? '{}') ?? {}; } catch { return {}; }
@@ -32,13 +38,25 @@ interface Swap {
   /** Contêiner onde a logo mora: acima da grade de tiles, que corta tudo que passa do seu topo. */
   layer: HTMLElement;
   img: HTMLImageElement;
+  /** Versão da arte do jogo quando a logo foi posta; se mudar (logo trocada), a logo sai e a nova entra. */
+  version: string;
+}
+
+/** Versão atual da arte do jogo, segundo a Steam. */
+function logoVersion(appId: string): string {
+  try { return versionKey((window as any).appStore?.GetAppOverviewByAppID?.(Number(appId))); } catch { return ''; }
 }
 
 /** Endereços que a própria Steam usa para a logo (inclui o hash do arquivo, que não dá para deduzir do appid). */
 function steamLogoUrls(appId: string): string[] {
   try {
-    const found: string[] = (window as any).appDetailsStore?.GetLogoImagesForAppId?.(Number(appId))?.rgLogoImages ?? [];
-    return found.map(url => url.startsWith('/') ? `https://steamloopback.host${url}` : url);
+    const id = Number(appId);
+    const overview = (window as any).appStore?.GetAppOverviewByAppID?.(id);
+    const details = (window as any).appDetailsStore;
+    // GetLogoImages põe as logos personalizadas (SteamGridDB etc.) antes das oficiais, como a Steam faz na tela.
+    const chosen: string[] = overview ? details?.GetLogoImages?.(overview)?.rgLogoImages ?? [] : [];
+    const official: string[] = details?.GetLogoImagesForAppId?.(id)?.rgLogoImages ?? [];
+    return uniqueUrls(chosen, official);
   } catch { return []; }
 }
 
@@ -95,7 +113,9 @@ function firstCardLeft(message: Element): number | null {
 export class NameLogos {
   private swaps = new Map<Element, Swap>();
   /** Resultado por jogo: a imagem já carregada (reaproveitada na tela, o servidor local leva ~0,5 s por arquivo) ou null. */
-  private logos = new Map<string, { img: HTMLImageElement | null; at: number }>();
+  private logos = new Map<string, { img: HTMLImageElement | null; at: number; v: string }>();
+  /** Desde quando cada texto em foco espera por uma logo (para mostrar o texto se ela demorar). */
+  private waiting = new Map<Element, { appId: string; since: number }>();
   private loading = new Set<string>();
   /** Logos guardadas entre sessões (data URLs): aparecem na hora, sem esperar o servidor local da Steam. */
   private stored = loadStored();
@@ -115,7 +135,22 @@ export class NameLogos {
     clearInterval(this.timer);
     this.timer = undefined;
     this.restoreAll();
-    mainWindow()?.document.getElementById(STYLE_ID)?.remove();
+    const doc = mainWindow()?.document;
+    doc?.getElementById(STYLE_ID)?.remove();
+    this.unmanageAll(doc);
+  }
+
+  /** Devolve todos os textos ao estado original da Steam (plugin parado ou logo desativada). */
+  private unmanageAll(doc: Document | undefined) {
+    this.waiting.clear();
+    doc?.querySelectorAll(`.${MANAGED_CLASS}`).forEach(node => node.classList.remove(MANAGED_CLASS, SHOW_CLASS));
+  }
+
+  /** Entrada guardada da logo, só se ainda for da versão atual da arte; senão é descartada. */
+  private entry(appId: string) {
+    const found = this.logos.get(appId);
+    if (found && found.v !== logoVersion(appId)) { this.logos.delete(appId); return undefined; }
+    return found;
   }
 
   /** Devolve o texto na hora e some com a logo; sem `fade` ela sai de uma vez (desligar, parar, janela oculta). */
@@ -149,24 +184,44 @@ export class NameLogos {
       return;
     }
     this.syncStyle(win, settings);
-    if (!settings.selectionLogo) { this.restoreAll(); this.status = 'logo desativada'; return; }
+    if (!settings.selectionLogo) { this.restoreAll(); this.unmanageAll(win.document); this.status = 'logo desativada'; return; }
 
     const seen = new Set<Element>();
     for (const message of win.document.querySelectorAll('.Message')) {
       if (!message.querySelector('.Content') || message.closest('.ExitActive')) continue;
       const appId = tileAppId(message);
       if (!appId) continue;
+      // Desde já o texto fica invisível: quando o card ganha o foco a Steam o mostra no mesmo quadro, e esperar o
+      // próximo ciclo deixava o nome antigo aparecer e sumir.
+      message.classList.add(MANAGED_CLASS);
       this.fromStore(win, appId);
-      if (win.getComputedStyle(message).visibility !== 'visible') { this.prefetch(win, appId); continue; }
+      if (win.getComputedStyle(message).visibility !== 'visible') {
+        message.classList.remove(SHOW_CLASS);
+        this.waiting.delete(message);
+        this.prefetch(win, appId);
+        continue;
+      }
       seen.add(message);
+      const version = logoVersion(appId);
       const swap = this.swaps.get(message);
-      if (swap && swap.appId === appId && swap.img.isConnected) continue;
-      if (swap) this.restore(message, true); // a Steam reaproveitou o bloco para outro jogo ou o refez
-      const loaded = this.logos.get(appId)?.img;
-      if (loaded) this.apply(win, message as HTMLElement, appId, loaded); else this.prefetch(win, appId);
+      if (swap && swap.appId === appId && swap.version === version && swap.img.isConnected) continue;
+      if (swap) this.restore(message, true); // outro jogo no mesmo bloco, bloco refeito ou logo trocada
+      const loaded = this.entry(appId)?.img;
+      if (loaded) { this.apply(win, message as HTMLElement, appId, loaded); continue; }
+      this.prefetch(win, appId);
+      this.revealIfStuck(message, appId);
     }
     for (const message of [...this.swaps.keys()]) if (!seen.has(message)) this.restore(message, true);
+    for (const message of [...this.waiting.keys()]) if (!seen.has(message)) this.waiting.delete(message);
     this.status = this.swaps.size ? `logo em ${[...this.swaps.values()].map(swap => swap.appId).join(', ')}` : 'sem logo em foco';
+  }
+
+  /** Card em foco sem logo (o jogo não tem, ou a busca demora): depois de um tempo o texto volta a aparecer. */
+  private revealIfStuck(message: Element, appId: string) {
+    const noLogo = this.entry(appId)?.img === null;
+    const wait = this.waiting.get(message);
+    if (!wait || wait.appId !== appId) this.waiting.set(message, { appId, since: Date.now() });
+    if (noLogo || Date.now() - (this.waiting.get(message)?.since ?? Date.now()) >= REVEAL_AFTER_MS) message.classList.add(SHOW_CLASS);
   }
 
   /** Regras que dependem das opções: o subtítulo ("Últimas duas semanas…") some sob demanda. */
@@ -177,7 +232,7 @@ export class NameLogos {
       style.id = STYLE_ID;
       win.document.head.appendChild(style);
     }
-    const css = `.${HIDDEN_CLASS}{opacity:0 !important}${settings.hideLastPlayed ? '.CarouselGameLabel .SubMessage{opacity:0 !important}' : ''}`;
+    const css = `.${MANAGED_CLASS}:not(.${SHOW_CLASS}),.${HIDDEN_CLASS}{opacity:0 !important}${settings.hideLastPlayed ? '.CarouselGameLabel .SubMessage{opacity:0 !important}' : ''}`;
     if (style.textContent !== css) style.textContent = css;
   }
 
@@ -193,6 +248,8 @@ export class NameLogos {
     if (!layer) return;
 
     // Reaproveita a imagem já carregada; se outro bloco já a usa, leva uma cópia.
+    message.classList.remove(SHOW_CLASS);
+    this.waiting.delete(message);
     const inUse = [...this.swaps.values()].some(swap => swap.img === loaded);
     const img = inUse ? loaded.cloneNode() as HTMLImageElement : loaded;
     img.alt = '';
@@ -202,7 +259,7 @@ export class NameLogos {
     if (win.getComputedStyle(layer).position === 'static') layer.style.position = 'relative';
     layer.appendChild(img);
     message.classList.add(HIDDEN_CLASS);
-    this.swaps.set(message, { appId, message, layer, img });
+    this.swaps.set(message, { appId, message, layer, img, version: logoVersion(appId) });
     this.place();
     win.requestAnimationFrame(() => { img.style.opacity = '1'; });
     if (!this.frame) this.frame = win.requestAnimationFrame(() => this.follow(win));
@@ -245,15 +302,16 @@ export class NameLogos {
   }
 
   private known(appId: string): boolean {
-    const known = this.logos.get(appId);
+    const known = this.entry(appId);
     return !!known && (!!known.img || Date.now() - known.at < NOT_FOUND_RETRY_MS);
   }
 
   /** Imagem da primeira logo que carrega para o jogo, ou null. O resultado (inclusive "não tem") fica em cache. */
   private async resolve(win: SteamWindow, appId: string): Promise<HTMLImageElement | null> {
     if (this.known(appId)) return this.logos.get(appId)!.img;
+    const v = logoVersion(appId);
     const found = await this.fetchLogo(win, appId);
-    this.logos.set(appId, { img: found, at: Date.now() });
+    this.logos.set(appId, { img: found, at: Date.now(), v });
     if (found) this.save(win, appId, found);
     return found;
   }
@@ -270,14 +328,16 @@ export class NameLogos {
   /** Usa a cópia guardada, se houver e ainda não houver imagem em memória; cópia velha é renovada em segundo plano. */
   private fromStore(win: SteamWindow, appId: string) {
     const saved = this.stored[appId];
-    if (!saved || this.logos.get(appId)?.img) return;
+    if (!saved || this.entry(appId)?.img) return;
+    // Cópia de outra versão da arte (logo trocada depois): não vale, a nova é buscada.
+    if (saved.v !== logoVersion(appId)) { delete this.stored[appId]; return; }
     const img = new win.Image();
     img.src = saved.data;
-    this.logos.set(appId, { img, at: Date.now() });
+    this.logos.set(appId, { img, at: Date.now(), v: saved.v });
     if (Date.now() - saved.at > STORE_REFRESH_MS && !this.refreshing.has(appId)) {
       this.refreshing.add(appId);
       void this.fetchLogo(win, appId).then(fresh => {
-        if (fresh) { this.logos.set(appId, { img: fresh, at: Date.now() }); this.save(win, appId, fresh); }
+        if (fresh) { this.logos.set(appId, { img: fresh, at: Date.now(), v: logoVersion(appId) }); this.save(win, appId, fresh); }
       }).finally(() => this.refreshing.delete(appId));
     }
   }
@@ -291,7 +351,7 @@ export class NameLogos {
       canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height);
       let data = canvas.toDataURL('image/webp', 0.92);
       if (!data.startsWith('data:image/webp')) data = canvas.toDataURL('image/png');
-      this.stored[appId] = { data, at: Date.now() };
+      this.stored[appId] = { data, at: Date.now(), v: logoVersion(appId) };
       const oldest = Object.keys(this.stored).sort((a, b) => this.stored[a].at - this.stored[b].at);
       for (const key of oldest.slice(0, Math.max(0, oldest.length - STORE_MAX))) delete this.stored[key];
       localStorage.setItem(STORE_KEY, JSON.stringify(this.stored));
